@@ -15,6 +15,7 @@ from stoix.base_types import Observation
 @struct.dataclass
 class BraxState(base.Base):
     pipeline_state: Optional[base.State]
+    discount : chex.Numeric
     obs: chex.Array
     reward: chex.Numeric
     done: chex.Numeric
@@ -22,12 +23,14 @@ class BraxState(base.Base):
     step_count: chex.Array
     metrics: Dict[str, jnp.ndarray] = struct.field(default_factory=dict)
     info: Dict[str, Any] = struct.field(default_factory=dict)
+   
 
 
 class BraxJumanjiWrapper(BraxWrapper):
     def __init__(
         self,
         env: Environment,
+        gamma =0.99,
     ):
         """Initialises a Brax wrapper.
 
@@ -37,6 +40,7 @@ class BraxJumanjiWrapper(BraxWrapper):
         super().__init__(env)
         self._env = env
         self._action_dim = self.action_spec().shape[0]
+        self.gamma = gamma
 
     def reset(self, key: chex.PRNGKey) -> Tuple[State, TimeStep]:
 
@@ -44,6 +48,7 @@ class BraxJumanjiWrapper(BraxWrapper):
 
         new_state = BraxState(
             pipeline_state=state.pipeline_state,
+            discount=jnp.array(1., dtype=float),
             obs=state.obs,
             reward=state.reward,
             done=state.done,
@@ -51,6 +56,7 @@ class BraxJumanjiWrapper(BraxWrapper):
             metrics=state.metrics,
             info=state.info,
             step_count=jnp.array(0, dtype=int),
+          
         )
         agent_view = new_state.obs.astype(float)
         legal_action_mask = jnp.ones((self._action_dim,), dtype=float)
@@ -72,10 +78,13 @@ class BraxJumanjiWrapper(BraxWrapper):
         # If the previous step was done
         prev_terminated = state.done.astype(jnp.bool_)
 
+        old_discount = state.discount##
+
         state = self._env.step(state, action)
 
         state = BraxState(
             pipeline_state=state.pipeline_state,
+            discount= self.gamma*old_discount,##
             obs=state.obs,
             reward=state.reward,
             done=state.done,

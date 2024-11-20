@@ -62,6 +62,64 @@ class NormalAffineTanhDistributionHead(nn.Module):
             AffineTanhTransformedDistribution(distribution, self.minimum, self.maximum),
             reinterpreted_batch_ndims=1,
         )
+    
+
+
+
+# class NormalAffineTanhDistributionHeadStable(nn.Module):
+
+#     action_dim: int
+#     minimum: float
+#     maximum: float
+#     min_scale: float = 1e-3
+#     kernel_init: Initializer = orthogonal(0.01)
+
+#     @nn.compact
+#     def __call__(self, embedding: chex.Array) -> Independent:
+
+#         loc = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+#         scale = (
+#             jax.nn.softplus(nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding))
+#             + self.min_scale
+#         )
+#         distribution = distrax.MultivariateNormalDiag(loc=loc, scale_diag=scale)
+
+#         return distribution
+        
+        
+class NormalAffineTanhDistributionHeadStable(nn.Module):
+    
+    action_dim: int
+    minimum: float
+    maximum:float
+    log_std_min: Optional[float] = -10
+    log_std_max: Optional[float] = 2
+    use_bias : bool = True
+    use_layer_norm : bool = True,
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(
+        self, embedding: jnp.ndarray) -> distrax.Distribution:
+       
+
+        means = nn.Dense(
+            self.action_dim, kernel_init=self.kernel_init,use_bias=self.use_bias,name="means"
+        )(embedding)
+    
+        log_stds = nn.Dense(
+            self.action_dim, kernel_init=self.kernel_init,use_bias=self.use_bias,name="log_stds"
+        )(embedding)
+    
+        log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
+
+        distribution = distrax.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_stds))
+        
+      
+        return distribution
+    
+    
+    
 
 
 class BetaDistributionHead(nn.Module):

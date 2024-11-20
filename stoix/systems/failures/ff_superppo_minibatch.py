@@ -40,7 +40,7 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
 
-
+from stoix.utils.jax_utils import merge_leading_dims
 
 
 
@@ -53,6 +53,8 @@ class Transition(NamedTuple):
     next_obs: chex.Array
     info: Dict
     discount : chex.Array
+    pre_action : chex.Array
+    log_prob: chex.Array
    
 
 
@@ -74,8 +76,7 @@ def get_warmup_fn(
             env_state, last_timestep, key = carry
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy = actor_apply_fn(params.actor_params, last_timestep.observation)
-            action = actor_policy.sample(seed=policy_key)
+            action,log_p,pre_action = actor_apply_fn(params.actor_params,last_timestep.observation,seed=policy_key)
 
             # STEP ENVIRONMENT
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
@@ -86,7 +87,8 @@ def get_warmup_fn(
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info,discount=env_state.env_state.discount,
+                last_timestep.observation, action, timestep.reward, done, next_obs, info,
+                discount=env_state.env_state.discount,log_prob=log_p,pre_action=pre_action,
             )
 
             return (env_state, timestep, key), transition
@@ -118,7 +120,7 @@ def get_learner_fn(
     """Get the learner function."""
 
     # Get apply and update functions for actor and critic networks.
-    actor_apply_fn, q_apply_fn = apply_fns
+    actor_apply_fn,actor_apply_fn_2, q_apply_fn = apply_fns
     actor_update_fn, q_update_fn, alpha_update_fn = update_fns
     buffer_add_fn, buffer_sample_fn = buffer_fns
 
@@ -133,9 +135,8 @@ def get_learner_fn(
 
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy = actor_apply_fn(params.actor_params, last_timestep.observation)
-
-            action = actor_policy.sample(seed=policy_key)
+            
+            action,log_p,pre_action = actor_apply_fn(params.actor_params, last_timestep.observation,policy_key)
 
             # STEP ENVIRONMENT
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
@@ -146,14 +147,15 @@ def get_learner_fn(
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info,discount=env_state.env_state.discount,
+                last_timestep.observation, action, timestep.reward, done, next_obs, info,
+                discount=env_state.env_state.discount,log_prob=log_p,pre_action=pre_action,
             )
-
             learner_state = OffPolicyLearnerState(
                 params, opt_states, buffer_state, key, env_state, timestep
             )
             return learner_state, transition
 
+        
         # STEP ENVIRONMENT FOR ROLLOUT LENGTH
         learner_state, traj_batch = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
@@ -174,9 +176,9 @@ def get_learner_fn(
                 key: chex.PRNGKey,
             ) -> jnp.ndarray:
                 """Eq 18 from https://arxiv.org/pdf/1812.05905.pdf."""
-                actor_policy = actor_apply_fn(actor_params, transitions.obs)
-                action = actor_policy.sample(seed=key)
-                log_prob = actor_policy.log_prob(action)
+                
+                #log_prob = transitions.log_prob.mean()
+                _,log_prob,_ = actor_apply_fn(actor_params, transitions.obs,key)
                 alpha = jnp.exp(log_alpha)
                 alpha_loss = alpha * jax.lax.stop_gradient(-log_prob - config.system.target_entropy)
 
@@ -194,17 +196,19 @@ def get_learner_fn(
                 transitions: Transition,
                 key: chex.PRNGKey,
             ) -> jnp.ndarray:
+                
+
                 q_old_action = q_apply_fn(q_params, transitions.obs, transitions.action)
-                next_actor_policy = actor_apply_fn(actor_params, transitions.next_obs)
-                next_action = next_actor_policy.sample(seed=key)
-                next_log_prob = next_actor_policy.log_prob(next_action)
-                next_q = q_apply_fn(target_q_params, transitions.next_obs, next_action)
-                next_v = jnp.min(next_q, axis=-1) - alpha * next_log_prob
+                next_action,next_log_prob,_  = actor_apply_fn(actor_params, transitions.next_obs,key)
+                
+                next_q = q_apply_fn(q_params, transitions.next_obs, next_action)
+                next_v = next_q - alpha * jnp.expand_dims(next_log_prob, -1) 
                 target_q = jax.lax.stop_gradient(
-                    transitions.reward + (1.0 - transitions.done) * config.system.gamma * next_v
+                    jnp.expand_dims(transitions.reward,-1) +config.system.gamma * jnp.expand_dims(1.0 - transitions.done,-1) *  next_v
                 )
-                q_error = q_old_action - jnp.expand_dims(target_q, -1)
-                q_loss = 0.5 * jnp.mean(jnp.square(q_error))
+                q_error = q_old_action-target_q
+                q_loss = 0.5*((q_old_action-target_q)**2).mean()
+
 
                 loss_info = {
                     "q_loss": jnp.mean(q_loss),
@@ -216,36 +220,49 @@ def get_learner_fn(
 
             def _actor_loss_fn(
                 actor_params: FrozenDict,
-                q_params: FrozenDict,
-                alpha: chex.Array,
+                adv : chex.Array,
                 transitions: Transition,
-                key: chex.PRNGKey,
-            ) -> chex.Array:
-                actor_policy = actor_apply_fn(actor_params, transitions.obs)
-                action = actor_policy.sample(seed=key)
-                log_prob = actor_policy.log_prob(action)
-                q_action = q_apply_fn(q_params, transitions.obs, action)
-                min_q = jnp.min(q_action, axis=-1)
-                actor_loss = alpha * log_prob - min_q
+            ) -> chex.Array:           
                 
-                ###############################################
-                actor_loss = (transitions.discount * actor_loss)
-                ###############################################
+             
+                discounts,logp,pre_actions =transitions.discount,transitions.log_prob,transitions.pre_action
+                
+                dist = actor_apply_fn_2(actor_params,transitions.obs)
+                pre_log_probs = dist.log_prob(pre_actions)
+                
+                new_logp = pre_log_probs - jnp.sum(2 * (jnp.log(2) - pre_actions - jax.nn.softplus(-2 * pre_actions)), axis=-1) #TODO :axis was -1
+                logratio = new_logp - logp
+                ratio = jnp.exp(logratio)
 
-                loss_info = {
-                    "actor_loss": jnp.mean(actor_loss),
-                    "entropy": jnp.mean(-log_prob),
+                # Calculate how much policy is changing
+                approx_kl = ((ratio - 1) - logratio).mean()
+
+                # Policy loss
+                clip_coef = 0.2 ### TODO:set
+                actor_loss1 = adv * ratio
+                actor_loss2 = adv * jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef)
+       
+                # actor_loss = -jnp.minimum(discounts*actor_loss1,discounts*actor_loss2).sum()/(discounts.sum())
+                # entropy = -1 * (discounts*logp).sum()/(discounts.sum())
+               
+
+                actor_loss = -jnp.minimum(actor_loss1,actor_loss2).mean()
+                entropy = -(log_p).mean()
+                
+                return actor_loss, {
+                    'actor_loss': actor_loss,
+                    'entropy': entropy,
+                    'approx_kl':approx_kl
                 }
-                return jnp.mean(actor_loss), loss_info
-
-            params, opt_states, buffer_state, key = update_state
-
-            key, sample_key, actor_key, q_key, alpha_key = jax.random.split(key, num=5)
             
+
+
+
+
             
-            def _critic_update(carry,_:Any):
+            def _q_update(carry,_:Any):
                 
-                    params,opt_states,rng = carry 
+                    params,opt_states,buffer_state,rng = carry 
                     alpha = jnp.exp(params.log_alpha)
                     rng,_ = jax.random.split(rng)
 
@@ -279,59 +296,128 @@ def get_learner_fn(
                     )
                     q_new_params = OnlineAndTarget(q_new_online_params, new_target_q_params)
 
-                    new_params = SACParams(params.actor_params, q_new_params, params.log_alpha)
-                    new_opt_state = SACOptStates(opt_states.actor_opt_state, q_new_opt_state, opt_states.alpha_opt_state)
+                    new_params = params._replace(q_params=q_new_params)
+                    new_opt_state = opt_states._replace (q_opt_state=q_new_opt_state)
 
-                    return (new_params,new_opt_state,rng),q_loss_info
-                
-            
-            
-            carry = (params,opt_states,q_key)
-            # (new_params,new_opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,1)            
-            # q_new_params,q_new_opt_state = new_params.q_params,new_opt_states.q_opt_state
-            
-            (params,opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,100) 
-            q_new_params,q_new_opt_state = params.q_params,opt_states.q_opt_state           
-            
-            
-            # SAMPLE TRANSITIONS
-            #transition_sample = buffer_sample_fn(buffer_state, sample_key)
-            #transitions: Transition = transition_sample.experience
-            transitions = jax.tree.map(lambda x:x.squeeze(),buffer_state.experience)
-            alpha = jnp.exp(params.log_alpha)
+                    return (new_params,new_opt_state,buffer_state,rng),q_loss_info
             
 
-            # CALCULATE ACTOR LOSS
-            actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
-            actor_grads, actor_loss_info = actor_grad_fn(
-                params.actor_params, params.q_params.online, alpha, transitions, actor_key
-            )
 
+            def _actor_update_step(carry,batch_info:Any):
+
+
+                params, opt_states,key = carry
+                actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
+                traj_sample,adv_sample = batch_info
+
+             
+
+                actor_grads, actor_loss_info = actor_grad_fn(params.actor_params, adv_sample, traj_sample)
+
+
+                # Compute the parallel mean (pmean) over the batch.
+                # This calculation is inspired by the Anakin architecture demo notebook.
+                # available at https://tinyurl.com/26tdzs5x
+                # This pmean could be a regular mean as the batch axis is on the same device.
+                actor_grads, actor_loss_info = jax.lax.pmean(
+                (actor_grads, actor_loss_info), axis_name="batch"
+                )
+                # pmean over devices.
+                actor_grads, actor_loss_info = jax.lax.pmean(
+                (actor_grads, actor_loss_info), axis_name="device"
+                )
+
+                # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+                actor_updates, actor_new_opt_state = actor_update_fn(
+                actor_grads, opt_states.actor_opt_state
+                )
+                actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+
+                new_params = params._replace(actor_params=actor_new_params)
+                new_opt_state = opt_states._replace(actor_opt_state=actor_new_opt_state)
+
+                return (new_params,new_opt_state,key),actor_loss_info
+            
+
+
+
+            params, opt_states, buffer_state, key= update_state 
+            key, sample_key, actor_key, q_key, alpha_key = jax.random.split(key, num=5)    
+
+
+            carry = (params,opt_states,buffer_state,q_key)
+            (params,opt_states,_,q_key),q_loss_info = jax.lax.scan(_q_update,carry,None,128) 
+            q_new_params,q_new_opt_state = params.q_params,opt_states.q_opt_state   
+
+
+
+            ################# SAMPLE TRANSITIONS ###############
+            
+            idx = buffer_state.current_index+ config.system.total_buffer_size*buffer_state.is_full
+
+            slice_size = config.system.rollout_length * config.arch.num_envs
+            transitions = jax.tree.map(lambda x:jax.lax.dynamic_slice_in_dim(x,idx-slice_size,slice_size,axis=1).squeeze(),buffer_state.experience)
+            #transitions = jax.tree.map(lambda x: x.squeeze(),buffer_state.experience)
    
 
-            # Compute the parallel mean (pmean) over the batch.
-            # This calculation is inspired by the Anakin architecture demo notebook.
-            # available at https://tinyurl.com/26tdzs5x
-            # This pmean could be a regular mean as the batch axis is on the same device.
-            actor_grads, actor_loss_info = jax.lax.pmean(
-                (actor_grads, actor_loss_info), axis_name="batch"
-            )
-            # pmean over devices.
-            actor_grads, actor_loss_info = jax.lax.pmean(
-                (actor_grads, actor_loss_info), axis_name="device"
-            )
+            ################## Compute advantage ################
+
+            j = 10
+            actor_params,q_params,alpha = params.actor_params,params.q_params,jnp.exp(params.log_alpha)
+            qs,logps = jnp.zeros((16384,)),jnp.zeros((16384,)) ### TODO: fix
+        
+            ### Compute value for the fixed states
             
-            # UPDATE ACTOR PARAMS AND OPTIMISER STATE
-            actor_updates, actor_new_opt_state = actor_update_fn(
-                actor_grads, opt_states.actor_opt_state
+            for i in range(j):
+                
+                actor_key,_ = jax.random.split(actor_key)
+                action, log_p,_ = actor_apply_fn(actor_params,transitions.obs,seed=actor_key)
+                q_all = q_apply_fn(q_params.online, transitions.obs, action)
+                q = jnp.mean(q_all,axis=1)
+                qs+=q
+                logps+=log_p
+                        
+            v = qs/j
+            h = -(logps/j)
+            
+            ### Compute advantage for the fixed states AND actions
+            q_all = q_apply_fn(q_params.online, transitions.obs,transitions.action)
+            q = jnp.mean(q_all,axis=1)
+            adv = q-v + alpha*(-transitions.log_prob-h)### This one worked
+            adv = jax.lax.stop_gradient(adv)
+            
+            ###########################################
+
+                   
+            # carry = (params,opt_states,adv)
+            # (params,opt_states,_,_,_),actor_loss_info = jax.lax.scan(_actor_update_step,carry,None,16) 
+            # actor_new_params,actor_new_opt_state = params.actor_params,opt_states.actor_opt_state   
+
+            batch_size = config.system.rollout_length * config.arch.num_envs
+            permutation = jax.random.permutation(sample_key, batch_size)
+            batch = (traj_batch, adv)
+            batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
+            shuffled_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), batch
             )
-            actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+            minibatches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, [16, -1] + list(x.shape[1:])), ##config.system.num_minibatches=16
+                shuffled_batch,
+            )
+
+            # UPDATE MINIBATCHES
+            (params, opt_states, key), actor_loss_info = jax.lax.scan(
+                _actor_update_step, (params, opt_states, key), minibatches
+            )
+
+            actor_new_params,actor_new_opt_state = params.actor_params,opt_states.actor_opt_state  
+        
 
         
             if config.system.autotune:
                 alpha_grad_fn = jax.grad(_alpha_loss_fn, has_aux=True)
                 alpha_grads, alpha_loss_info = alpha_grad_fn(
-                    params.log_alpha, params.actor_params, transitions, alpha_key
+                    params.log_alpha, params.actor_params, transitions, alpha_key,
                 )
                 alpha_grads, alpha_loss_info = jax.lax.pmean(
                     (alpha_grads, alpha_loss_info), axis_name="batch"
@@ -363,6 +449,10 @@ def get_learner_fn(
             return (new_params, new_opt_state, buffer_state, key), loss_info
 
         update_state = (params, opt_states, buffer_state, key)
+        
+        #######################################
+        #init_env_state,init_timestep = learner_state.env_state,learner_state.timestep
+        #######################################
 
         # UPDATE EPOCHS
         update_state, loss_info = jax.lax.scan(
@@ -374,6 +464,9 @@ def get_learner_fn(
             params, opt_states, buffer_state, key, env_state, last_timestep
         )
         metric = traj_batch.info
+        ###########################
+        #learner_state = learner_state._replace(env_state=init_env_state,timestep=init_timestep)
+        ###########################
         return learner_state, (metric, loss_info)
 
     def learner_fn(
@@ -438,12 +531,12 @@ def learner_setup(
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
 
     actor_optim = optax.chain(
-        #optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(actor_lr),
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(actor_lr,eps=1e-5),
     )
     q_optim = optax.chain(
-        #optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr),
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(q_lr,eps=1e-5),
     )
 
     # Initialise observation
@@ -471,19 +564,21 @@ def learner_setup(
 
     alpha_lr = make_learning_rate(config.system.alpha_lr, config, config.system.epochs)
     alpha_optim = optax.chain(
-        #optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(alpha_lr),
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(alpha_lr,eps=1e-5),
     )
     alpha_opt_state = alpha_optim.init(log_alpha)
 
     params = SACParams(actor_params, OnlineAndTarget(online_q_params, target_q_params), log_alpha)
     opt_states = SACOptStates(actor_opt_state, q_opt_state, alpha_opt_state)
 
-    actor_network_apply_fn = actor_network.apply
+    
+    actor_network_apply_fn = actor_network.sample
+    actor_network_apply_fn2 = actor_network.apply
     q_network_apply_fn = double_q_network.apply
 
     # Pack apply and update functions.
-    apply_fns = (actor_network_apply_fn, q_network_apply_fn)
+    apply_fns = (actor_network_apply_fn,actor_network_apply_fn2,q_network_apply_fn)
     update_fns = (actor_optim.update, q_optim.update, alpha_optim.update)
 
     # Create replay buffer
@@ -495,6 +590,8 @@ def learner_setup(
         next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
         info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
         discount=jnp.zeros((), dtype=float),
+        log_prob = jnp.zeros((), dtype=float),
+        pre_action=jnp.zeros((action_dim), dtype=float),
     )
 
     assert config.system.total_buffer_size % n_devices == 0, (
@@ -606,13 +703,21 @@ def run_experiment(_config: DictConfig) -> float:
     # Setup learner.
     learn, actor_network, learner_state = learner_setup(
         env, (key, actor_net_key, q_net_key), config
+        
+        
     )
+    
+    def eval_act_fn(params: FrozenDict, observation: chex.Array, key: chex.PRNGKey):
+        
+        action,_,_ =  actor_network.sample(params,observation,key)
+        
+        return action
 
     # Setup evaluator.
     evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
         eval_env=eval_env,
         key_e=key_e,
-        eval_act_fn=get_distribution_act_fn(config, actor_network.apply),
+        eval_act_fn= eval_act_fn,
         params=learner_state.params.actor_params,
         config=config,
     )

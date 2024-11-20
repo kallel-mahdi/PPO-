@@ -90,6 +90,15 @@ class ActorCriticParams(NamedTuple):
 
     actor_params: FrozenDict
     critic_params: FrozenDict
+    
+    
+
+class ActorCriticQParams(NamedTuple):
+    """Parameters of an actor critic network."""
+
+    actor_params: FrozenDict
+    critic_params: FrozenDict
+    q_params : FrozenDict
 
 
 class ActorCriticOptStates(NamedTuple):
@@ -97,6 +106,15 @@ class ActorCriticOptStates(NamedTuple):
 
     actor_opt_state: OptState
     critic_opt_state: OptState
+    
+
+
+class ActorCriticQOptStates(NamedTuple):
+    """OptStates of actor critic learner."""
+
+    actor_opt_state: OptState
+    critic_opt_state: OptState
+    q_opt_state: OptState
 
 
 class ActorCriticHiddenStates(NamedTuple):

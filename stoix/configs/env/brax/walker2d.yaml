@@ -2,11 +2,11 @@
 env_name: brax
 
 scenario:
-  name : halfcheetah
-  task_name: halfcheetah
+  name: walker2d
+  task_name: walker2d
 
 kwargs: {
-  backend: positional
+  backend: positional,
 }
 
 # Defines the metric that will be used to evaluate the performance of the agent.

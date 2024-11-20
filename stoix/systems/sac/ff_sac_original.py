@@ -41,21 +41,6 @@ from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
 
 
-
-
-
-from typing_extensions import NamedTuple
-class Transition(NamedTuple):
-    obs: chex.ArrayTree
-    action: chex.Array
-    reward: chex.Array
-    done: chex.Array
-    next_obs: chex.Array
-    info: Dict
-    discount : chex.Array
-   
-
-
 def get_warmup_fn(
     env: Environment,
     params: SACParams,
@@ -86,7 +71,7 @@ def get_warmup_fn(
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info,discount=env_state.env_state.discount,
+                last_timestep.observation, action, timestep.reward, done, next_obs, info
             )
 
             return (env_state, timestep, key), transition
@@ -146,7 +131,7 @@ def get_learner_fn(
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info,discount=env_state.env_state.discount,
+                last_timestep.observation, action, timestep.reward, done, next_obs, info
             )
 
             learner_state = OffPolicyLearnerState(
@@ -227,10 +212,6 @@ def get_learner_fn(
                 q_action = q_apply_fn(q_params, transitions.obs, action)
                 min_q = jnp.min(q_action, axis=-1)
                 actor_loss = alpha * log_prob - min_q
-                
-                ###############################################
-                actor_loss = (transitions.discount * actor_loss)
-                ###############################################
 
                 loss_info = {
                     "actor_loss": jnp.mean(actor_loss),
@@ -241,65 +222,11 @@ def get_learner_fn(
             params, opt_states, buffer_state, key = update_state
 
             key, sample_key, actor_key, q_key, alpha_key = jax.random.split(key, num=5)
-            
-            
-            def _critic_update(carry,_:Any):
-                
-                    params,opt_states,rng = carry 
-                    alpha = jnp.exp(params.log_alpha)
-                    rng,_ = jax.random.split(rng)
 
-                    # SAMPLE TRANSITIONS
-                    transition_sample = buffer_sample_fn(buffer_state, rng)
-                    transitions: Transition = transition_sample.experience
-                    alpha = jnp.exp(params.log_alpha)
-                    
-                    
-                    # CALCULATE Q LOSS
-                    q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
-                    q_grads, q_loss_info = q_grad_fn(
-                    params.q_params.online,
-                    params.actor_params,
-                    params.q_params.target,
-                    alpha,
-                    transitions,
-                    q_key,
-                    )
-                    
-                    q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="batch")
-                    q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
-                    
-                    
-                    # UPDATE Q PARAMS AND OPTIMISER STATE
-                    q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state)
-                    q_new_online_params = optax.apply_updates(params.q_params.online, q_updates)
-                    # Target network polyak update.
-                    new_target_q_params = optax.incremental_update(
-                        q_new_online_params, params.q_params.target, config.system.tau
-                    )
-                    q_new_params = OnlineAndTarget(q_new_online_params, new_target_q_params)
-
-                    new_params = SACParams(params.actor_params, q_new_params, params.log_alpha)
-                    new_opt_state = SACOptStates(opt_states.actor_opt_state, q_new_opt_state, opt_states.alpha_opt_state)
-
-                    return (new_params,new_opt_state,rng),q_loss_info
-                
-            
-            
-            carry = (params,opt_states,q_key)
-            # (new_params,new_opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,1)            
-            # q_new_params,q_new_opt_state = new_params.q_params,new_opt_states.q_opt_state
-            
-            (params,opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,100) 
-            q_new_params,q_new_opt_state = params.q_params,opt_states.q_opt_state           
-            
-            
             # SAMPLE TRANSITIONS
-            #transition_sample = buffer_sample_fn(buffer_state, sample_key)
-            #transitions: Transition = transition_sample.experience
-            transitions = jax.tree.map(lambda x:x.squeeze(),buffer_state.experience)
+            transition_sample = buffer_sample_fn(buffer_state, sample_key)
+            transitions: Transition = transition_sample.experience
             alpha = jnp.exp(params.log_alpha)
-            
 
             # CALCULATE ACTOR LOSS
             actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
@@ -307,7 +234,16 @@ def get_learner_fn(
                 params.actor_params, params.q_params.online, alpha, transitions, actor_key
             )
 
-   
+            # CALCULATE Q LOSS
+            q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
+            q_grads, q_loss_info = q_grad_fn(
+                params.q_params.online,
+                params.actor_params,
+                params.q_params.target,
+                alpha,
+                transitions,
+                q_key,
+            )
 
             # Compute the parallel mean (pmean) over the batch.
             # This calculation is inspired by the Anakin architecture demo notebook.
@@ -320,14 +256,10 @@ def get_learner_fn(
             actor_grads, actor_loss_info = jax.lax.pmean(
                 (actor_grads, actor_loss_info), axis_name="device"
             )
-            
-            # UPDATE ACTOR PARAMS AND OPTIMISER STATE
-            actor_updates, actor_new_opt_state = actor_update_fn(
-                actor_grads, opt_states.actor_opt_state
-            )
-            actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
-        
+            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="batch")
+            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
+
             if config.system.autotune:
                 alpha_grad_fn = jax.grad(_alpha_loss_fn, has_aux=True)
                 alpha_grads, alpha_loss_info = alpha_grad_fn(
@@ -348,8 +280,21 @@ def get_learner_fn(
                 alpha_new_opt_state = opt_states.alpha_opt_state
                 alpha_loss_info = {"alpha_loss": 0.0, "alpha": alpha}
 
+            # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+            actor_updates, actor_new_opt_state = actor_update_fn(
+                actor_grads, opt_states.actor_opt_state
+            )
+            actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
-            
+            # UPDATE Q PARAMS AND OPTIMISER STATE
+            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state)
+            q_new_online_params = optax.apply_updates(params.q_params.online, q_updates)
+            # Target network polyak update.
+            new_target_q_params = optax.incremental_update(
+                q_new_online_params, params.q_params.target, config.system.tau
+            )
+            q_new_params = OnlineAndTarget(q_new_online_params, new_target_q_params)
+
             # PACK NEW PARAMS AND OPTIMISER STATE
             new_params = SACParams(actor_new_params, q_new_params, log_alpha_new_params)
             new_opt_state = SACOptStates(actor_new_opt_state, q_new_opt_state, alpha_new_opt_state)
@@ -463,7 +408,7 @@ def learner_setup(
     # Automatic entropy tuning
     target_entropy = -config.system.target_entropy_scale * action_dim
     if config.system.autotune:
-        log_alpha = -3.91*jnp.ones_like(target_entropy)
+        log_alpha = jnp.zeros_like(target_entropy)
     else:
         log_alpha = jnp.log(config.system.init_alpha)
 
@@ -494,7 +439,6 @@ def learner_setup(
         done=jnp.zeros((), dtype=bool),
         next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
         info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
-        discount=jnp.zeros((), dtype=float),
     )
 
     assert config.system.total_buffer_size % n_devices == 0, (

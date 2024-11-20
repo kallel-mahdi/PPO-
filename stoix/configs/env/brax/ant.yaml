@@ -6,7 +6,7 @@ scenario:
   task_name: ant
 
 kwargs: {
-  backend: spring
+  backend: positional
 }
 
 # Defines the metric that will be used to evaluate the performance of the agent.

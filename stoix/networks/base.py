@@ -29,6 +29,19 @@ class FeedForwardActor(nn.Module):
         obs_embedding = self.torso(obs_embedding)
 
         return self.action_head(obs_embedding)
+    
+    
+    def sample(self,params,observation,seed):
+        
+        dist = self.apply(params,observation)
+        pre_action,pre_log_p = dist.sample_and_log_prob(seed=seed)
+        action = jax.nn.tanh(pre_action)
+        log_ps = pre_log_p - jnp.sum(2 * (jnp.log(2) - pre_action - jax.nn.softplus(-2 * pre_action)), axis=-1)        
+        
+        return action,log_ps,pre_action
+        
+        
+        
 
 
 class FeedForwardCritic(nn.Module):

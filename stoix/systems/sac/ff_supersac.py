@@ -40,7 +40,9 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
 
-
+# Enable detailed logging for JAX compilation and execution
+# jax.config.update('jax_debug_nans', True)  # For debugging NaN issues
+# jax.config.update('jax_log_compiles', True)  # Log compiler trace
 
 
 
@@ -154,6 +156,31 @@ def get_learner_fn(
             )
             return learner_state, transition
 
+        ##################### RESET ALL ENVIRONMENTS (for discount) ##################
+        
+        # n_devices = 1
+        
+        
+        
+        # key, *env_keys = jax.random.split(
+        #     jax.random.PRNGKey(42), n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
+        # )
+        
+        # env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
+        # jnp.stack(env_keys),
+        # )
+        # reshape_states = lambda x: x.reshape(
+        #     (1, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        # )
+
+        # # (devices, update batch size, num_envs, ...)
+        # env_states = jax.tree_util.tree_map(reshape_states, env_states)
+        # timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
+        
+        # learner_state = learner_state._replace(env_state=env_states,timestep=timesteps)
+        
+        ###############################################################################
+        
         # STEP ENVIRONMENT FOR ROLLOUT LENGTH
         learner_state, traj_batch = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
@@ -198,6 +225,8 @@ def get_learner_fn(
                 next_actor_policy = actor_apply_fn(actor_params, transitions.next_obs)
                 next_action = next_actor_policy.sample(seed=key)
                 next_log_prob = next_actor_policy.log_prob(next_action)
+                
+                
                 next_q = q_apply_fn(target_q_params, transitions.next_obs, next_action)
                 next_v = jnp.min(next_q, axis=-1) - alpha * next_log_prob
                 target_q = jax.lax.stop_gradient(
@@ -205,6 +234,15 @@ def get_learner_fn(
                 )
                 q_error = q_old_action - jnp.expand_dims(target_q, -1)
                 q_loss = 0.5 * jnp.mean(jnp.square(q_error))
+                
+                # next_q = q_apply_fn(q_params, transitions.next_obs, next_action)
+                # next_v = next_q - alpha * jnp.expand_dims(next_log_prob, -1) 
+                # target_q = jax.lax.stop_gradient(
+                #     jnp.expand_dims(transitions.reward,-1) +config.system.gamma * jnp.expand_dims(1.0 - transitions.done,-1) *  next_v
+                # )
+                # q_error = q_old_action-target_q
+                # q_loss = 0.5*((q_old_action-target_q)**2).mean()
+
 
                 loss_info = {
                     "q_loss": jnp.mean(q_loss),
@@ -229,7 +267,7 @@ def get_learner_fn(
                 actor_loss = alpha * log_prob - min_q
                 
                 ###############################################
-                actor_loss = (transitions.discount * actor_loss)
+                #actor_loss = (transitions.discount * actor_loss)
                 ###############################################
 
                 loss_info = {
@@ -279,18 +317,14 @@ def get_learner_fn(
                     )
                     q_new_params = OnlineAndTarget(q_new_online_params, new_target_q_params)
 
-                    new_params = SACParams(params.actor_params, q_new_params, params.log_alpha)
-                    new_opt_state = SACOptStates(opt_states.actor_opt_state, q_new_opt_state, opt_states.alpha_opt_state)
+                    new_params = params._replace(q_params=q_new_params)
+                    new_opt_state = opt_states._replace (q_opt_state=q_new_opt_state)
 
                     return (new_params,new_opt_state,rng),q_loss_info
                 
             
-            
             carry = (params,opt_states,q_key)
-            # (new_params,new_opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,1)            
-            # q_new_params,q_new_opt_state = new_params.q_params,new_opt_states.q_opt_state
-            
-            (params,opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,100) 
+            (params,opt_states,q_key),q_loss_info = jax.lax.scan(_critic_update,carry,None,128) 
             q_new_params,q_new_opt_state = params.q_params,opt_states.q_opt_state           
             
             
@@ -298,6 +332,8 @@ def get_learner_fn(
             #transition_sample = buffer_sample_fn(buffer_state, sample_key)
             #transitions: Transition = transition_sample.experience
             transitions = jax.tree.map(lambda x:x.squeeze(),buffer_state.experience)
+            # idx = buffer_state.current_index+50000*buffer_state.is_full
+            # transitions = jax.tree.map(lambda x:jax.lax.dynamic_slice_in_dim(x,idx-5000,5000,axis=1).squeeze(),buffer_state.experience)
             alpha = jnp.exp(params.log_alpha)
             
 
@@ -363,6 +399,10 @@ def get_learner_fn(
             return (new_params, new_opt_state, buffer_state, key), loss_info
 
         update_state = (params, opt_states, buffer_state, key)
+        
+        #######################################
+        # init_env_state,init_timestep = learner_state.env_state,learner_state.timestep
+        #######################################
 
         # UPDATE EPOCHS
         update_state, loss_info = jax.lax.scan(
@@ -374,6 +414,9 @@ def get_learner_fn(
             params, opt_states, buffer_state, key, env_state, last_timestep
         )
         metric = traj_batch.info
+        ###########################
+        #learner_state = learner_state._replace(env_state=init_env_state,timestep=init_timestep)
+        ###########################
         return learner_state, (metric, loss_info)
 
     def learner_fn(
