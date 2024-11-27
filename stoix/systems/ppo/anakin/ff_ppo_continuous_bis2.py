@@ -36,7 +36,7 @@ from stoix.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
+from stoix.utils.loss import clipped_value_loss, ppo_clip_loss,ppo_clip_loss_discount
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
@@ -62,6 +62,7 @@ class PPOTransition(NamedTuple):
     log_prob: chex.Array
     obs: chex.Array
     next_obs : chex.Array
+    discount : chex.Array
     info: Dict
 
 #############################
@@ -130,6 +131,7 @@ def get_learner_fn(
                 log_prob,
                 last_timestep.observation,
                 timestep.observation,
+                env_state.env_state.discount,
                 info,
             )
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
@@ -157,6 +159,8 @@ def get_learner_fn(
             standardize_advantages=config.system.standardize_advantages,
             truncation_flags=traj_batch.truncated,
         )
+
+
 
 
 
@@ -200,8 +204,8 @@ def get_learner_fn(
                     log_prob = actor_policy.log_prob(traj_batch.action)
 
                     # CALCULATE ACTOR LOSS
-                    loss_actor = ppo_clip_loss(
-                        log_prob, traj_batch.log_prob, gae, config.system.clip_eps
+                    loss_actor = ppo_clip_loss_discount(
+                        log_prob, traj_batch.log_prob, gae, config.system.clip_eps,traj_batch.discount,
                     )
                     entropy = actor_policy.entropy(seed=rng_key).mean()
 
@@ -460,6 +464,19 @@ def get_learner_fn(
                 truncation_flags=traj_batch.truncated,
                 )
 
+            def compute_v(rng,params,traj_batch):
+
+                policy = actor_apply_fn(params.actor_params,traj_batch.obs)
+                actions = policy.sample(seed=rng)
+                q = q_apply_fn(params.q_params,traj_batch.obs,actions)
+
+                return q
+            
+            # v = jax.vmap(compute_v,in_axes=(0,None,None))(jax.random.split(key,10),params,traj_batch)
+            # v = jnp.mean(v,axis=0)
+                
+            
+            
             v = critic_apply_fn(params.critic_params, traj_batch.obs)
             q = q_apply_fn(params.q_params,traj_batch.obs,traj_batch.action)
             

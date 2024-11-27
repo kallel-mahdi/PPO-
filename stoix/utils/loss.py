@@ -32,6 +32,25 @@ def ppo_clip_loss(
     return loss_actor
 
 
+
+
+def ppo_clip_loss_discount(
+    pi_log_prob_t: chex.Array, b_pi_log_prob_t: chex.Array, gae_t: chex.Array, epsilon: float,discount:chex.Array,
+) -> chex.Array:
+    ratio = jnp.exp(pi_log_prob_t - b_pi_log_prob_t)
+    loss_actor1 = ratio * gae_t
+    loss_actor2 = (
+        jnp.clip(
+            ratio,
+            1.0 - epsilon,
+            1.0 + epsilon,
+        )
+        * gae_t
+    )
+    loss_actor = -jnp.minimum(discount*loss_actor1, discount*loss_actor2)
+    loss_actor = loss_actor.mean()
+    return loss_actor
+
 def ppo_penalty_loss(
     pi_log_prob_t: chex.Array,
     b_pi_log_prob_t: chex.Array,
