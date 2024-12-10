@@ -36,7 +36,7 @@ from stoix.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
+from stoix.utils.loss import clipped_value_loss, ppo_clip_loss,ppo_clip_loss_disc
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
@@ -49,7 +49,7 @@ from stoix.wrappers.episode_metrics import get_final_step_metrics
 from typing_extensions import NamedTuple
 from stoix.base_types import Action, ActorCriticHiddenStates, Done, Truncated, Value
 
-alpha = 0.03
+alpha = 0.05
 
 class PPOTransition(NamedTuple):
     """Transition tuple for PPO."""
@@ -62,6 +62,7 @@ class PPOTransition(NamedTuple):
     log_prob: chex.Array
     obs: chex.Array
     next_obs : chex.Array
+    discount : chex.Array
     info: Dict
 
 #############################
@@ -130,8 +131,11 @@ def get_learner_fn(
                 log_prob,
                 last_timestep.observation,
                 timestep.observation,
+                env_state.env_state.discount,
                 info,
             )
+            
+            
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
             return learner_state, transition
 
@@ -200,9 +204,14 @@ def get_learner_fn(
                     log_prob = actor_policy.log_prob(traj_batch.action)
 
                     # CALCULATE ACTOR LOSS
-                    loss_actor = ppo_clip_loss(
-                        log_prob, traj_batch.log_prob, gae, config.system.clip_eps
+                    # loss_actor = ppo_clip_loss(
+                    #     log_prob, traj_batch.log_prob, gae, config.system.clip_eps
+                    # )
+                    
+                    loss_actor = ppo_clip_loss_disc(
+                        log_prob, traj_batch.log_prob, gae, config.system.clip_eps,traj_batch.discount,
                     )
+                    
                     entropy = actor_policy.entropy(seed=rng_key).mean()
 
                     #total_loss_actor = loss_actor - config.system.ent_coef * entropy
@@ -412,35 +421,28 @@ def get_learner_fn(
 
             ### UNPACK STATE
             params, opt_states, traj_batch, advantages, targets, key = update_state
-            key, shuffle_key = jax.random.split(key)
+            
 
-            # SHUFFLE MINIBATCHES
-            batch_size = config.system.rollout_length * config.arch.num_envs
-            permutation = jax.random.permutation(shuffle_key, batch_size)
-            batch = (traj_batch, advantages, targets)
-            batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
-            shuffled_batch = jax.tree_util.tree_map(
-                lambda x: jnp.take(x, permutation, axis=0), batch
-            )
-            # minibatches = jax.tree_util.tree_map(
-            #     lambda x: jnp.reshape(x, [config.system.num_minibatches, -1] + list(x.shape[1:])),
-            #     shuffled_batch,
-            # )
+            
+            for i in range(4):
+                # SHUFFLE MINIBATCHES
+                key, shuffle_key = jax.random.split(key)
+                batch_size = config.system.rollout_length * config.arch.num_envs
+                permutation = jax.random.permutation(shuffle_key, batch_size)
+                batch = (traj_batch, advantages, targets)
+                batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
+                shuffled_batch = jax.tree_util.tree_map(
+                    lambda x: jnp.take(x, permutation, axis=0), batch
+                )
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: jnp.reshape(x, [config.system.num_minibatches, -1] + list(x.shape[1:])),
+                    shuffled_batch,
+                )
 
-
-            minibatches = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, [256, -1] + list(x.shape[1:])),
-                shuffled_batch,
-            )
-
-           
-
-           
-
-            # UPDATE MINIBATCHES
-            (params, opt_states, key), critic_loss_info = jax.lax.scan(
-                _update_critics, (params, opt_states, key), minibatches
-            )
+                # UPDATE MINIBATCHES
+                (params, opt_states, key), critic_loss_info = jax.lax.scan(
+                    _update_critics, (params, opt_states, key), minibatches
+                )
 
 
             # # CALCULATE ADVANTAGE
@@ -459,10 +461,23 @@ def get_learner_fn(
                 standardize_advantages=config.system.standardize_advantages,
                 truncation_flags=traj_batch.truncated,
                 )
-
-            v = critic_apply_fn(params.critic_params, traj_batch.obs)
-            q = q_apply_fn(params.q_params,traj_batch.obs,traj_batch.action)
             
+            
+            
+            def compute_value(params,obs,key):
+                
+                policy = actor_apply_fn(params.actor_params,obs)
+                actions = policy.sample(seed=key)
+                q = q_apply_fn(params.q_params,obs,actions)
+                
+                return q
+            
+            v = jax.vmap(compute_value,in_axes=(None,None,0))(params,traj_batch.obs,jax.random.split(key,10))
+            v = jnp.mean(v,axis=0)
+                
+
+            #v = critic_apply_fn(params.critic_params, traj_batch.obs)
+            q = q_apply_fn(params.q_params,traj_batch.obs,traj_batch.action)
             
             policy = actor_apply_fn(params.actor_params,traj_batch.obs)
             entropy = policy.entropy(seed=key)
