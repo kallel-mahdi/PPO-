@@ -6,7 +6,7 @@ scenario:
   task_name: halfcheetah
 
 kwargs: {
-  backend: positional
+  backend: mjx
 }
 
 # Defines the metric that will be used to evaluate the performance of the agent.

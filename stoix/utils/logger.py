@@ -25,6 +25,7 @@ class LogEvent(Enum):
     EVAL = "evaluator"
     ABSOLUTE = "absolute"
     MISC = "misc"
+    HIST = "table"
 
 
 class StoixLogger:

@@ -30,7 +30,7 @@ class BraxJumanjiWrapper(BraxWrapper):
     def __init__(
         self,
         env: Environment,
-        gamma =0.995,
+        gamma =0.995 #A
     ):
         """Initialises a Brax wrapper.
 

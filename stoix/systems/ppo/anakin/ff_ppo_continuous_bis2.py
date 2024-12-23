@@ -37,7 +37,7 @@ from stoix.utils.jax_utils import (
 )
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import clipped_value_loss, ppo_clip_loss,ppo_clip_loss_disc
-from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
+from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation2,batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
@@ -49,7 +49,10 @@ from stoix.wrappers.episode_metrics import get_final_step_metrics
 from typing_extensions import NamedTuple
 from stoix.base_types import Action, ActorCriticHiddenStates, Done, Truncated, Value
 
-alpha = 0.05
+import os
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]="0.5"
+
+alpha = 0.025
 
 class PPOTransition(NamedTuple):
     """Transition tuple for PPO."""
@@ -152,35 +155,17 @@ def get_learner_fn(
         v_t = jnp.concatenate([traj_batch.value, last_val[None, ...]], axis=0)
         d_t = 1.0 - traj_batch.done.astype(jnp.float32)
         d_t = (d_t * config.system.gamma).astype(jnp.float32)
-        advantages, targets = batch_truncated_generalized_advantage_estimation(
-            r_t,
-            d_t,
-            config.system.gae_lambda,
-            v_t,
-            time_major=True,
-            standardize_advantages=config.system.standardize_advantages,
-            truncation_flags=traj_batch.truncated,
-        )
+        # advantages, targets = batch_truncated_generalized_advantage_estimation2(
+        #     r_t,
+        #     d_t,
+        #     config.system.gae_lambda,
+        #     v_t+v_t[None,-1],
+        #     time_major=True,
+        #     standardize_advantages=config.system.standardize_advantages,
+        #     truncation_flags=traj_batch.truncated,
+        # )
 
-
-
-        # v = critic_apply_fn(params.critic_params, traj_batch.obs)
-        # q = q_apply_fn(params.q_params,traj_batch.obs,traj_batch.action)
-        
-        
-        # policy = actor_apply_fn(params.actor_params,traj_batch.obs)
-        # entropy = policy.entropy(seed=key)
-        
-        # advantages2 = q-v+ alpha*(-traj_batch.log_prob -entropy )
-        # advantages2 = jax.lax.stop_gradient(advantages2)
-        
-        # if config.system.standardize_advantages:
-            
-        #     advantages = jax.nn.standardize(advantages, axis=(0, 1))
-        #     advantages2= jax.nn.standardize(advantages2, axis=(0, 1))
-        
-        
-        # jax.debug.print("ADV BIAS {} ADV ERROR? {} RELATIVE ERROR {}",jnp.mean((advantages-advantages2)),jnp.mean(jnp.abs(advantages-advantages2)),jnp.median(jnp.abs((advantages-advantages2)/advantages2)))
+        advantages,targets = traj_batch.value,traj_batch.value
 
 
 
@@ -339,7 +324,9 @@ def get_learner_fn(
                     next_q = q_apply_fn(q_params, traj_batch.next_obs, next_action)
                     
                     target_q = traj_batch.reward + config.system.gamma *(1.0 - traj_batch.done) *  (next_q- alpha*next_log_p)
-                    q_error = q_old_action-jax.lax.stop_gradient(target_q)
+                    target_q = jax.lax.stop_gradient(target_q)
+                    
+                    q_error = q_old_action-target_q
                     q_loss = 0.5*jnp.square(q_error).mean()
                     
                 
@@ -376,8 +363,6 @@ def get_learner_fn(
                 critic_grads, critic_loss_info = jax.lax.pmean(
                     (critic_grads, critic_loss_info), axis_name="device"
                 )
-                
-             
     
 
                 # UPDATE CRITIC PARAMS AND OPTIMISER STATE
@@ -445,23 +430,6 @@ def get_learner_fn(
                 )
 
 
-            # # CALCULATE ADVANTAGE
-            last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
-
-            r_t = traj_batch.reward
-            v_t = jnp.concatenate([traj_batch.value, last_val[None, ...]], axis=0)
-            d_t = 1.0 - traj_batch.done.astype(jnp.float32)
-            d_t = (d_t * config.system.gamma).astype(jnp.float32)
-            advantages2, targets = batch_truncated_generalized_advantage_estimation(
-                r_t,
-                d_t,
-                config.system.gae_lambda,
-                v_t,
-                time_major=True,
-                standardize_advantages=config.system.standardize_advantages,
-                truncation_flags=traj_batch.truncated,
-                )
-            
             
             
             def compute_value(params,obs,key):
@@ -475,7 +443,6 @@ def get_learner_fn(
             v = jax.vmap(compute_value,in_axes=(None,None,0))(params,traj_batch.obs,jax.random.split(key,10))
             v = jnp.mean(v,axis=0)
                 
-
             #v = critic_apply_fn(params.critic_params, traj_batch.obs)
             q = q_apply_fn(params.q_params,traj_batch.obs,traj_batch.action)
             
@@ -483,17 +450,54 @@ def get_learner_fn(
             entropy = policy.entropy(seed=key)
             
             advantages = q-v+ alpha*(-traj_batch.log_prob -entropy )
-            advantages = jax.lax.stop_gradient(advantages)
+            advantages = jax.lax.stop_gradient(advantages) 
+            #advantages *= traj_batch.    to be continued ...   
+
             
-            if config.system.standardize_advantages:
+            # if config.system.standardize_advantages:
                 
-                advantages = jax.nn.standardize(advantages, axis=(0, 1))
+            #     advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
-            jax.debug.print("ADV BIAS {} ADV ERROR? {} RELATIVE ERROR {}",jnp.mean((advantages-advantages2)),jnp.mean(jnp.abs(advantages-advantages2)),jnp.median(jnp.abs((advantages-advantages2)/advantages2)))
+        
+            # # CALCULATE ADVANTAGE
+            last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
+            values = critic_apply_fn(params.critic_params, traj_batch.obs)
+
+            r_t = traj_batch.reward
+            #v_t = jnp.concatenate([traj_batch.value, last_val[None, ...]], axis=0)
+            v_t = jnp.concatenate([values, last_val[None, ...]], axis=0)
+            d_t = 1.0 - traj_batch.done.astype(jnp.float32)
+            d_t = (d_t * config.system.gamma).astype(jnp.float32)
+            advantages2, targets = batch_truncated_generalized_advantage_estimation2(
+                r_t,
+                d_t,
+                config.system.gae_lambda,
+                advantages,
+                time_major=True,
+                standardize_advantages=config.system.standardize_advantages,
+                truncation_flags=traj_batch.truncated,
+                )
+
+            # advantages2, targets = batch_truncated_generalized_advantage_estimation(
+            #     r_t,
+            #     d_t,
+            #     config.system.gae_lambda,
+            #     v_t,
+            #     time_major=True,
+            #     standardize_advantages=config.system.standardize_advantages,
+            #     truncation_flags=traj_batch.truncated,
+            #     )
+            
+            
+            
+            #jax.debug.print(f'error {jnp.abs(advantages-advantages2).mean()}')
+            #jax.debug.print("🤯 x:{x} 🤯", x=jnp.abs(advantages-advantages2).mean())
 
 
+            #for i in range(4):
             # SHUFFLE MINIBATCHES
             batch_size = config.system.rollout_length * config.arch.num_envs
+            shuffle_key,_ = jax.random.split(shuffle_key)
             permutation = jax.random.permutation(shuffle_key, batch_size)
             batch = (traj_batch, advantages, targets)
             batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
@@ -518,7 +522,7 @@ def get_learner_fn(
 
         # UPDATE EPOCHS
         update_state, loss_info = jax.lax.scan(
-            _update_epoch, update_state, None, config.system.epochs
+            _update_epoch, update_state, None,config.system.epochs
         )
 
         params, opt_states, traj_batch, advantages, targets, key = update_state
