@@ -79,6 +79,7 @@ def batch_truncated_generalized_advantage_estimation(
         return acc, acc
 
     #jax.debug.print(f'{delta_t.shape}, {discount_t.shape}, {lambda_.shape}, {truncation_mask.shape},')
+    #ax.debug.print("🤯 {discount_t} 🤯", discount_t=discount_t)
     _, advantage_t = jax.lax.scan(
         _body,
         jnp.zeros(batch_size),

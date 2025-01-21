@@ -40,6 +40,10 @@ from stoix.wrappers.transforms import (
 from stoix.wrappers.xminigrid import XMiniGridWrapper
 
 
+from brax import envs
+from jax_envs.envs.quadruped.barkour import BarkourEnv
+envs.register_environment('barkour', BarkourEnv)
+
 def make_jumanji_env(
     env_name: str,
     config: DictConfig,

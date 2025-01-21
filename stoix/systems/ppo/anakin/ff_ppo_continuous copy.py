@@ -50,7 +50,7 @@ from stoix.base_types import Action, ActorCriticHiddenStates, Done, Truncated, V
 import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]="0.5"
 
-alpha = 0.025
+alpha = 0.01
 
 class PPOTransition(NamedTuple):
     """Transition tuple for PPO."""

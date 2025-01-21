@@ -2,8 +2,8 @@
 env_name: brax
 
 scenario:
-  name: hopper
-  task_name: hopper
+  name: barkour
+  task_name: barkour
 
 kwargs: {
   backend: mjx

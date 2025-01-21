@@ -8,7 +8,7 @@ actor_network:
   action_head:
     _target_: stoix.networks.heads.NormalAffineTanhDistributionHeadStable 
 
-q_network:
+critic_network:
   input_layer:
     _target_: stoix.networks.inputs.ObservationActionInput
   pre_torso:

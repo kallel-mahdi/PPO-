@@ -42,6 +42,37 @@ from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
 
 
+import os
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]="0.5"
+
+
+from typing_extensions import NamedTuple
+from stoix.base_types import Action, ActorCriticHiddenStates, Done, Truncated, Value
+
+#############################
+class PPOTransition(NamedTuple):
+    """Transition tuple for PPO."""
+
+    done: Done
+    truncated: Truncated
+    action: Action
+    value: Value
+    reward: chex.Array
+    log_prob: chex.Array
+    obs: chex.Array
+    next_obs : chex.Array
+    discount : chex.Array
+    info: Dict
+
+#############################
+
+
+
+
+
+""" Separate the update epoch into two functions, one for the actor and one for the critic. """
+
+
 def get_learner_fn(
     env: Environment,
     apply_fns: Tuple[ActorApply, CriticApply],
@@ -103,8 +134,11 @@ def get_learner_fn(
                 timestep.reward,
                 log_prob,
                 last_timestep.observation,
+                timestep.observation,
+                env_state.env_state.discount,
                 info,
             )
+            
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
             return learner_state, transition
 
